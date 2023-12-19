@@ -531,36 +531,38 @@ int signApp(NSString* appPath)
 	if(!mainExecutablePath) return 176;
 
 	if(![[NSFileManager defaultManager] fileExistsAtPath:mainExecutablePath]) return 174;
-	
-	NSObject *tsBundleIsPreSigned = appInfoDict[@"TSBundlePreSigned"];
-	if([tsBundleIsPreSigned isKindOfClass:[NSNumber class]])
-	{
-		// if TSBundlePreSigned = YES, this bundle has been externally signed so we can skip over signing it now
-		NSNumber *tsBundleIsPreSignedNum = (NSNumber *)tsBundleIsPreSigned;
-		if([tsBundleIsPreSignedNum boolValue] == YES)
-		{
-			NSLog(@"[signApp] taking fast path for app which declares it has already been signed (%@)", mainExecutablePath);
-			return 0;
-		}
-	}
 
-	// XXX: There used to be a check here whether the main binary was already signed with bypass
-	// In that case it would skip signing aswell, no clue if that's still needed
-	// With the new bypass adhoc signing should fail and reapplying the bypass should produce an identical binary
-	/*SecStaticCodeRef codeRef = getStaticCodeRef(mainExecutablePath);
-	if(codeRef != NULL)
+	// Check if the bundle has had a supported exploit pre-applied
+	EXPLOIT_TYPE declaredPreAppliedExploitType = getDeclaredExploitTypeFromInfoDictionary(appInfoDict);
+	if(isPlatformVulnerableToExploitType(declaredPreAppliedExploitType))
 	{
-		if(codeCertChainContainsFakeAppStoreExtensions(codeRef))
-		{
-			NSLog(@"[signApp] taking fast path for app signed using a custom root certificate (%@)", mainExecutablePath);
-			CFRelease(codeRef);
-			return 0;
-		}
+		NSLog(@"[signApp] taking fast path for app which declares use of a supported pre-applied exploit (%@)", mainExecutablePath);
+		return 0;
 	}
 	else
 	{
-		NSLog(@"[signApp] failed to get static code, can't derive entitlements from %@, continuing anways...", mainExecutablePath);
-	}*/
+		NSLog(@"[signApp] app (%@) declares use of a pre-applied exploit that is not supported on this device. Proceeding to re-sign...", mainExecutablePath);
+	}
+
+	// If the app doesn't declare a pre-applied exploit, and the host supports fake custom root certs,
+	// we can also skip doing any work here when that app is signed with fake roots
+	// If not, with the new bypass, a previously modified binary should failed to be adhoc signed, and
+	// reapplying the bypass should produce an identical binary
+	if(isPlatformVulnerableToExploitType(EXPLOIT_TYPE_CUSTOM_ROOT_CERTIFICATE_V1))
+	{
+		SecStaticCodeRef codeRef = getStaticCodeRef(mainExecutablePath);
+		if(codeRef != NULL)
+		{
+			if(codeCertChainContainsFakeAppStoreExtensions(codeRef))
+			{
+				NSLog(@"[signApp] taking fast path for app signed using a custom root certificate (%@)", mainExecutablePath);
+				CFRelease(codeRef);
+				return 0;
+			}
+
+			CFRelease(codeRef);
+		}
+	}
 
 	NSURL* fileURL;
 	NSDirectoryEnumerator *enumerator;
@@ -664,6 +666,11 @@ int signApp(NSString* appPath)
 					if (r == 0) {
 						NSLog(@"[%@] Applied CoreTrust bypass!", filePath);
 					}
+					else if (r == 2) {
+						NSLog(@"[%@] Cannot apply CoreTrust bypass on an encrypted binary!", filePath);
+						fat_free(fat);
+						return 180;
+					}
 					else {
 						NSLog(@"[%@] CoreTrust bypass failed!!! :(", filePath);
 						fat_free(fat);
@@ -738,6 +745,7 @@ void applyPatchesToInfoDictionary(NSString* appPath)
 // 172: no info.plist found in app
 // 173: app is not signed and cannot be signed because ldid not installed or didn't work
 // 174: 
+// 180: tried to sign encrypted binary
 int installApp(NSString* appPackagePath, BOOL sign, BOOL force, BOOL isTSUpdate, BOOL useInstalldMethod)
 {
 	NSLog(@"[installApp force = %d]", force);
@@ -907,7 +915,10 @@ int installApp(NSString* appPackagePath, BOOL sign, BOOL force, BOOL isTSUpdate,
 	// Also permissions need to be fixed
 	NSURL* updatedAppURL = findAppURLInBundleURL(appContainer.url);
 	fixPermissionsOfAppBundle(updatedAppURL.path);
-	registerPath(updatedAppURL.path, 0, YES);
+	if (!registerPath(updatedAppURL.path, 0, YES)) {
+		[[NSFileManager defaultManager] removeItemAtURL:appContainer.url error:nil];
+		return 181;
+	}
 	return 0;
 }
 
@@ -1012,6 +1023,7 @@ int uninstallAppById(NSString* appId, BOOL useCustomMethod)
 
 // 166: IPA does not exist or is not accessible
 // 167: IPA does not appear to contain an app
+// 180: IPA contains an encrypted binary
 int installIpa(NSString* ipaPath, BOOL force, BOOL useInstalldMethod)
 {
 	cleanRestrictions();
